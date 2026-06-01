@@ -192,7 +192,12 @@ def extract_ticker(page: dict) -> Optional[str]:
 
 
 def update_page_prices(page_id: str, prices: dict[str, Optional[float]]) -> bool:
-    """Write price fields and Last Market Sync timestamp back to a Notion page."""
+    """Write price fields and Last Market Sync timestamp back to a Notion page.
+
+    Notion's API rate limit is ~3 req/sec averaged. We sleep briefly before each
+    write to stay comfortably under that, and we retry with exponential backoff
+    if we hit a 429 anyway (e.g., another integration sharing the workspace).
+    """
     properties: dict = {}
 
     for key, prop_name in PRICE_PROPERTIES.items():
@@ -205,11 +210,27 @@ def update_page_prices(page_id: str, prices: dict[str, Optional[float]]) -> bool
     }
 
     url = f"{NOTION_BASE}/pages/{page_id}"
-    resp = requests.patch(url, headers=notion_headers(), json={"properties": properties}, timeout=30)
-    if resp.status_code != 200:
+
+    # Baseline throttle: ~3 writes/sec keeps us safely under Notion's limit
+    time.sleep(0.34)
+
+    for attempt in range(5):
+        resp = requests.patch(url, headers=notion_headers(), json={"properties": properties}, timeout=30)
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 429:
+            # Honor Retry-After header if present, otherwise back off exponentially
+            retry_after = resp.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else (2 ** attempt) * 2
+            print(f"  Notion rate-limited on page {page_id}. Waiting {wait}s and retrying (attempt {attempt + 1}/5).")
+            time.sleep(wait)
+            continue
+        # Non-429 errors are not retried — they indicate a real problem (bad property name, etc.)
         print(f"  Notion update failed for page {page_id}: HTTP {resp.status_code} - {resp.text[:300]}")
         return False
-    return True
+
+    print(f"  Notion update failed for page {page_id} after 5 retries (persistent rate limiting).")
+    return False
 
 
 # ---------- Main ----------
